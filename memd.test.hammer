@@ -1,0 +1,194 @@
+#!/usr/bin/perl
+
+use strict;
+use Cache::Memcached::Fast;
+use String::Random qw(random_regex random_string);
+use Time::HiRes qw( usleep ualarm gettimeofday tv_interval nanosleep );
+
+my $memHost = shift;
+my $count = shift;
+
+# autoflush
+local $| = 1;
+
+# local vars
+my $t0 = 0;
+my $elapsed = 0;
+my $key = '';
+my $writeFlag = 0;
+# temp datastore
+my $ds = {};
+
+if(!defined $memHost || !defined $count || $count < 1)
+{
+	die qq?usage: $0 <memcache_host> <number_of_keys>\n?;
+}
+
+## CONNECT MEMCACHED
+my $memd = new Cache::Memcached::Fast({
+  servers => [ { address => $memHost, weight => 1, noreply => 1 }, ],
+  nowait => 1,
+  close_on_error => 0,
+  max_size => 512,
+});
+$memd->set("hammer.connected",1) || die qq?ERROR: Can't connect to MEMCACHED...\n?;
+
+print qq?Memcached Test Hammer.. CONNECTED!\n?;
+
+while(1)
+{
+	$key = getkey("command [h/g/w/d/v/x] : ");
+	
+	if($key eq "h")
+	{
+		print qq?\n?;
+		print qq?Help Menu\n?;
+		print qq? h: show this help menu\n?;
+		print qq? g: generate test data\n?;
+		print qq? w: write test data to memcached\n?;
+		print qq? v: verify test data with memcached\n?;
+		print qq? d: delete test data from memcached\n?;
+		print qq? x: exit\n?;
+		print qq?\n?;
+	}
+	elsif ($key =~ /^g/i)
+	{
+		my($j,$num) = split(/\s+/,$key);
+		$count = $num if(defined $num && $num > 0);
+		do_generate();
+	}
+	elsif ($key eq "w")
+	{	
+		test_have_keys();
+		do_write();
+		$writeFlag = 1;
+	}
+	elsif ($key eq "v")
+	{
+		test_have_keys();
+		test_did_write();
+		do_validate();
+	}
+	elsif ($key eq "d")
+	{	
+		test_have_keys();
+		next if test_did_write() == 0;
+		do_delete();
+		$writeFlag = 0;
+	}
+	elsif ($key =~ /^[x|q]/i)
+	{
+		last;
+	}
+	else
+	{
+		print qq? * INVALID COMMAND '$key'\n?
+			if length($key);
+	}
+}
+
+sub test_have_keys {
+		print qq? * (WARNING) You haven't generated any test data yet\n?
+			if scalar(keys %{$ds}) == 0;
+		next
+			if scalar(keys %{$ds}) == 0;
+}
+
+sub test_did_write {
+	print qq? * (WARNING) You haven't written anything to memcache yet\n?
+		if $writeFlag == 0;
+	
+	return $writeFlag > 0 ? 1 : 0;
+}
+
+## GENERATE DATA
+sub do_generate {
+	$ds = {}; # clear out any old data
+	print qq? * generating $count random key/value pairs as test data....?;
+	timer_start();
+	my $kCount = $count;
+	while($kCount--)
+	{
+		my $randString = random_regex('srvloc_\w{5,15}_\w{20,35}');
+		$ds->{$randString} = random_regex('\w{100,200}');
+	}
+	timer_delta("generation took");
+}
+
+## PUSH DATA
+sub do_write {
+	print qq? * writing test data to memcache....?;
+	timer_start();
+	foreach my $key (keys %{$ds})
+	{
+		$memd->set($key,$ds->{$key});
+	}
+	timer_delta("writing data took");
+}
+
+## VALIDATE DATA
+sub do_validate {
+	print qq? * validating test data in memcache....\n\n?;
+	timer_start();
+	my $cntMissing = 0;
+	my $cntIncorrect = 0;
+	my $cntKeys = 0;
+	foreach my $key (keys %{$ds})
+	{
+		my $val = $memd->get($key);
+		if(!defined $val)
+		{
+			$cntMissing++;
+		}
+		elsif($val ne $ds->{$key})
+		{
+			$cntIncorrect = 0;
+		}
+		$cntKeys++;
+	}	
+	print qq?###########################\n?;
+	timer_delta("time: ");
+	print qq?key count: $cntKeys\n?;
+	print qq?keys missing: $cntMissing\n?;
+	print qq?keys baddata: $cntIncorrect\n?;
+	print qq?###########################\n\n?;
+}
+
+## DELETE DATA
+sub do_delete {
+	print qq? * deleting test data from memcache....?;
+	timer_start();
+	foreach my $key (keys %{$ds})
+	{
+		$memd->delete($key);
+	}
+	timer_delta("delete took");
+}
+
+#####################################
+# HELPER FUNCTIONS
+#####################################
+
+sub getkey {
+	my $message = shift;
+	$message = "press enter to continue" if !defined $message;
+
+	print qq?$message?;
+	
+	my $inp = <STDIN>;
+	chomp($inp);
+	
+	return $inp;
+}
+
+sub timer_start {
+	$t0 = [gettimeofday];
+}
+
+sub timer_delta {
+	my $msgPrefix = shift;
+	$msgPrefix = "elapsed" if !$msgPrefix || !length($msgPrefix);
+	$elapsed = tv_interval ( $t0 );
+	$elapsed *= 1000;
+	print qq?$msgPrefix $elapsed ms\n?;
+}

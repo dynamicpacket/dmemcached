@@ -1,0 +1,284 @@
+#!/usr/bin/perl
+
+use strict;
+use YAML::Tiny;
+use Data::Dumper;
+use Memcached::Server;
+use Cache::Memcached::Fast;
+use Hash::ConsistentHash;
+use String::CRC32;
+use AE;
+
+# find config
+my $cfgFile = shift;
+$cfgFile = '/etc/dmemcached.conf' if !defined $cfgFile || !-e $cfgFile;
+$cfgFile = 'dmemcached.conf' if !defined $cfgFile || !-e $cfgFile;
+die qq?usage: $0 <config_file>\n? if !-e $cfgFile;
+
+# read config
+my $cfg = YAML::Tiny->read( $cfgFile );
+
+# make sure config is valid YAML
+if(!$cfg)
+{
+	my $err = $YAML::Tiny::errstr;
+	$err =~ s/\s*YAML\:\:Tiny\s*//gi;
+	die qq?CONFIG ERROR: $err\n?;
+}
+
+# our globals
+my $dmdReplicas = defined($cfg->[0]->{replicas}) ? $cfg->[0]->{replicas} : 0;
+my $dmdReadRandom = defined($cfg->[0]->{randomread}) ? $cfg->[0]->{randomread} : 0;
+my $dmdListenHost = '0';
+my $dmdListenPort = '11211';
+
+my $dmdNoWait = defined($cfg->[0]->{nowait}) ? $cfg->[0]->{nowait} : 0;
+my $dmdNoReply = defined($cfg->[0]->{noreply}) ? $cfg->[0]->{noreply} : 0;
+
+my $dmdPingInterval = defined($cfg->[0]->{pinginterval}) ? $cfg->[0]->{pinginterval} : 30;
+my $dmdPingFailRetry = defined($cfg->[0]->{failretry}) ? $cfg->[0]->{failretry} : 60;
+my $dmdFailFlush = defined($cfg->[0]->{failflush}) ? $cfg->[0]->{failflush} : 0;
+
+my $mccBucket = {};
+my $mccBucketWeights = {};
+my $mccBucketDead = {};
+my $mccBucketCountAlive = 0;
+my $mccHash = {};
+
+if(fork() > 0)
+{
+	print qq?Starting daemon...\n?;
+	exit();
+}
+
+# initialize our config and buckets
+init();
+
+# setup alarms
+local $SIG{ALRM} = \&alarm_check_servers;
+alarm_check_servers();
+
+#####################################################################
+## PROXY & EVENT LOOP
+#####################################################################
+
+# our SERVER
+my $server = Memcached::Server->new(
+    no_extra => 1,
+    open => [ [$dmdListenHost, $dmdListenPort] ],
+    cmd => {
+    	# custom handlers
+        '_find' => sub {
+            my($cb, $key, $client) = @_;
+            #_debug(qq?called find?);
+            $cb->(0); # not found
+        },
+        'get' => sub {
+            my($cb, $key, $client) = @_;
+            #_debug(qq?called get?);            
+            my $val = mcdGet($key);
+            if(defined $val)
+            {
+				$cb->(1, $val);
+            }
+            else
+            {
+            	$cb->(0);
+            }
+        },
+        'set' => sub {
+            my($cb, $key, $flag, $expire, $value, $client) = @_;
+            my $retVal = mcdSet($key,$value,$expire);
+			if(defined $retVal)
+			{
+				$cb->($retVal);
+			}
+			else
+			{
+	            # error, but keep connection alive
+				$cb->(-1, "ERROR SETTING");
+			}
+        },
+        'delete' => sub {
+            my($cb, $key, $client) = @_;
+            my $retVal = mcdSet($key,undef);
+            $cb->(1);
+        },
+        'flush_all' => sub {
+            my($cb, $client) = @_;
+			# do nothing
+            $cb->();
+        },
+    }
+);
+
+## show something on the screen
+print qq?Listening for connections on $dmdListenHost : $dmdListenPort\n?;
+
+## start event loop
+AE::cv->recv;
+
+###############################################################
+## SUPPORT FUNCTIONS
+###############################################################
+
+sub alarm_check_servers {
+	foreach my $mc (keys %{$mccBucket})
+	{
+		my $val = time();
+		
+		# skip if bucket is dead and we're waiting
+		next if defined $mccBucketDead->{$mc} 
+			&& $mccBucketDead->{$mc} >= ($val-1);
+		
+		my $status = 0;
+		# ping bucket
+		if(	$mccBucket->{$mc}->{cache}->set('dmcd.ping',$val) && 
+			$mccBucket->{$mc}->{cache}->get('dmcd.ping') == $val)
+		{
+			$status = 1;
+		}
+		
+		if(defined $mccBucketDead->{$mc} && $status > 0)
+		{
+			# bucket came alive!
+			print qq?INFO: BUCKET '$mc' is now ALIVE!! (flush:$dmdFailFlush)\n?;
+			
+			# failflush, if set, flush all keys in this bucket
+			#  on rejoin
+			$mccBucket->{$mc}->{cache}->flush_all()
+				if $dmdFailFlush;
+
+			$mccBucketCountAlive++;
+			delete $mccBucketDead->{$mc};
+		}
+		elsif(!defined $mccBucketDead->{$mc} && $status < 1)
+		{
+			# bucket is now dead
+			print qq?INFO: BUCKET '$mc' is now DEAD!!\n?;
+			$mccBucketCountAlive--;
+			# earliest time we should check this bucket again
+			$mccBucketDead->{$mc} = $val + $dmdPingFailRetry;
+		}
+	}
+	
+	# reset check in 30 seconds
+	alarm($dmdPingInterval);
+}
+
+sub init {
+	# listen address
+	if(defined $cfg->[0]->{listen})
+	{
+		my($h,$p) = split(/\:/,$cfg->[0]->{listen});
+		$dmdListenHost = $h if ($h && length($h));
+		$dmdListenPort = $p if ($p && length($p));
+	}
+	
+	# memcached servers
+	if(defined $cfg->[0]->{buckets} && scalar($cfg->[0]->{buckets}) > 0)
+	{
+		foreach my $s(@{$cfg->[0]->{buckets}})
+		{
+			my($h,$w) = split(/,/,$s);
+			$w = 1 if(!defined $w || !$w);
+			
+			my $node = {
+				cache => mcdCreate($h),
+				weight => $w,
+			};
+			
+			$mccBucket->{$h} = $node;
+			$mccBucketWeights->{$h} = $w;
+		}
+	}
+	else
+	{
+		die qq?CONFIG ERROR: Need to define at least 1 cache server...\n?;
+	}
+	
+	if($dmdReplicas > 0 && ($dmdReplicas > (scalar(keys %{$mccBucketWeights}) / 3 * 2)))
+	{
+		die qq?CONFIG ERROR: Maximum CACHEs / REPLICA ratio is 3 / 2...\n?;
+	}
+	
+	$mccHash = Hash::ConsistentHash->new(
+	        buckets   => $mccBucketWeights,
+	        hash_func => \&crc32
+	);
+	
+	# set initial number of buckets
+	$mccBucketCountAlive = scalar(keys %{$mccBucket});
+}
+
+sub mcdCreate {
+	my $host = shift;
+
+	# create client
+	my $mcc = new Cache::Memcached::Fast({
+		servers => [ { address => $host, noreply => $dmdNoReply } ],
+		#  connect_timeout => 0.5,
+		#  io_timeout => 1,
+		#  failure_timeout => 2,
+		nowait => $dmdNoWait,
+		max_size => 1024,
+		# keep trying to reconnect!
+		max_failures => 1000,
+		# every 10 seconds
+		failure_timeout => 10,
+	});
+	
+	return $mcc;
+}
+
+sub mcdGet {
+	my $key = shift;
+	
+	my $reps = 0;
+	my $bucketKey = $mccHash->lookup($key);
+	
+	# GET $key from our DMEMCACHED
+	while($reps <= $dmdReplicas && $reps <= $mccBucketCountAlive)
+	{
+		my $buck = $bucketKey->();
+
+		# skip buckets marked as dead
+		next if defined $mccBucketDead->{$buck};
+
+		my $val = $mccBucket->{$buck}->{cache}->get($key);
+		return $val if $val;	
+		$reps++;	
+	}	
+	
+	return undef;
+}
+
+sub mcdSet {
+	my $key = shift;
+	my $val = shift;
+	my $expires = shift;	
+	
+	my $isDelete = (defined $val) ? 0 : 1;
+	$expires = 0 if (!defined $expires || $expires < 1);
+
+	my $bucketKey = $mccHash->lookup($key);
+	
+	# SET or DELETE $key in our DMEMCACHED
+	my $reps = 0;
+	while($reps <= $dmdReplicas && $reps <= $mccBucketCountAlive)
+	{
+		my $buck = $bucketKey->();
+	
+		# skip buckets marked as dead
+		next if defined $mccBucketDead->{$buck};
+
+		$mccBucket->{$buck}->{cache}->set($key,$val,$expires)
+			if $isDelete == 0;
+		$mccBucket->{$buck}->{cache}->delete($key)
+			if $isDelete == 1;
+
+		$reps++;
+	}	
+	
+	return 1;
+}
